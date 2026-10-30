@@ -35,6 +35,14 @@ token lifetimes stop while the computer sleeps, so after a sleep `$cache`
 can outlast the cache until the next run clears it; the bar goes by the
 clock. Agents other than Claude get no tokens.
 
+`$cache_bar` (johntrandall's fork): `▰▰▰▱▱▱ 14:52` on stock Herdr, which
+knows no `format = "bar"`. It loses a segment each sixth of the cache time
+and ends with the expiry time; it goes once the cache has expired. Stock
+Herdr shows a token as reported and can't count down, so a ticker (see
+ticker) rewrites the idle agents' bars at segment boundaries only, about
+six reports per agent per cache time; the watcher keeps the working
+agents' bars current as it does their other tokens.
+
 Herdr starts no run when Claude switches conversation without a status
 change (`/clear`, `/resume`), so the tokens keep showing the previous
 conversation until the agent next works.
@@ -53,7 +61,10 @@ import fcntl
 import glob
 import hashlib
 import json
+import math
 import os
+import resource
+import signal
 import subprocess
 import sys
 import time
@@ -66,7 +77,15 @@ LABEL_TOKEN = "cache"
 TIME_TOKEN = "cache_until"
 SPAN_TOKEN = "cache_span"
 SIZE_TOKEN = "cache_tokens"
-TOKENS = (LABEL_TOKEN, TIME_TOKEN, SPAN_TOKEN, SIZE_TOKEN)
+BAR_TOKEN = "cache_bar"
+TOKENS = (LABEL_TOKEN, TIME_TOKEN, SPAN_TOKEN, SIZE_TOKEN, BAR_TOKEN)
+BAR_SEGMENTS = 6
+# A bar is reported to live until shortly after its next boundary, so a dead
+# ticker leaves no bar that overstates the time left.
+BAR_GRACE_SECONDS = 60
+# The ticker never sleeps longer than this: a sleeping Mac stops the clock
+# its wait uses, and on waking it works the bars out again from the wall clock.
+TICKER_MAX_SLEEP_SECONDS = 300
 SCRIPT = os.path.abspath(__file__)
 # Herdr sets it for its runs; a run by hand uses the current folder, and
 # starts no watcher (see start_watcher).
@@ -99,9 +118,25 @@ WATCH_FAILURES_MAX = 5
 LOG_MAX = 64 << 10
 
 
+HERDR_CALLS = 0
+
+
+def perf_log(line):
+    """Cost measurements, written only while the state directory holds a
+    perf.on file. Each line: kind, then fields."""
+    if not os.path.exists(os.path.join(STATE_DIR, "perf.on")):
+        return
+    own, kids = resource.getrusage(resource.RUSAGE_SELF), resource.getrusage(resource.RUSAGE_CHILDREN)
+    cpu = own.ru_utime + own.ru_stime + kids.ru_utime + kids.ru_stime
+    with open(os.path.join(STATE_DIR, "perf.log"), "a") as f:
+        f.write(f"{line} t={time.time():.1f} pid={os.getpid()} cpu_total={cpu:.3f} calls_total={HERDR_CALLS}\n")
+
+
 def herdr(*args):
     """Run a Herdr CLI command and return its parsed JSON result, if it
     prints one."""
+    global HERDR_CALLS
+    HERDR_CALLS += 1
     binary = os.environ.get("HERDR_BIN_PATH", "herdr")
     completed = subprocess.run(
         [binary, *args],
@@ -362,13 +397,40 @@ def report(agent, window):
         clear_tokens(pane_id, tokens, (SIZE_TOKEN,))
     now = time.time()
     if until <= now:
-        clear_tokens(pane_id, tokens, (LABEL_TOKEN,))
+        clear_tokens(pane_id, tokens, (LABEL_TOKEN, BAR_TOKEN))
         return
+    if tokens.get(BAR_TOKEN) != bar(sent, until, now):
+        report_bar(pane_id, sent, until, now)
     label = datetime.fromtimestamp(until).strftime("cache %H:%M")
     # A new expiry in the same minute keeps the label but moves its end.
     if tokens.get(LABEL_TOKEN) != label or tokens.get(TIME_TOKEN) != str(until):
         ttl_ms = min(max(1, int((until - now) * 1000)), TTL_MAX_MS)
         set_tokens(pane_id, {LABEL_TOKEN: label}, "--ttl-ms", str(ttl_ms))
+
+
+def bar(start, until, now):
+    """`▰▰▰▱▱▱ 14:52`: the segments of the cache time still left, rounded up,
+    so the last segment shows until the cache expires, then the expiry time."""
+    left = segments_left(start, until, now)
+    return "▰" * left + "▱" * (BAR_SEGMENTS - left) + datetime.fromtimestamp(until).strftime(" %H:%M")
+
+
+def segments_left(start, until, now):
+    span = max(until - start, 1)
+    return min(BAR_SEGMENTS, max(1, math.ceil((until - now) * BAR_SEGMENTS / span)))
+
+
+def next_boundary(start, until, now):
+    """When the bar next loses a segment (the last one goes at expiry)."""
+    span = max(until - start, 1)
+    return until - (segments_left(start, until, now) - 1) * span / BAR_SEGMENTS
+
+
+def report_bar(pane_id, start, until, now):
+    """Report the bar alone, to live until just past its next boundary."""
+    lifetime = min(next_boundary(start, until, now) + BAR_GRACE_SECONDS, until) - now
+    ttl_ms = min(max(1, int(lifetime * 1000)), TTL_MAX_MS)
+    set_tokens(pane_id, {BAR_TOKEN: bar(start, until, now)}, "--ttl-ms", str(ttl_ms))
 
 
 def set_tokens(pane_id, values, *options):
@@ -396,6 +458,20 @@ def reconcile():
     failed = report_all(agents, files)
     if any(watched(agent) for agent in agents):
         start_watcher()
+    # The idle agents whose bar the ticker must step down.
+    now = time.time()
+    windows = {}
+    for agent in agents:
+        path = files.get(agent["pane_id"])
+        if path is None or agent["agent_status"] == "working":
+            continue
+        window = cache_window(path)
+        if window and window[1] > now:
+            windows[agent["pane_id"]] = [window[0], int(window[1])]
+    write_windows(windows)
+    if windows:
+        kick_ticker()
+    perf_log(f"run agents={len(agents)} warm_idle={len(windows)} failed={int(failed)}")
     return failed
 
 
@@ -508,6 +584,7 @@ def watch():
                     held = True
                 if agents:
                     report_all(agents, {agent["pane_id"]: conversation_file(agent) for agent in agents})
+                perf_log(f"watch working={len(agents) if agents else 0}")
             if agents is None:
                 if not os.path.exists(SESSION):
                     log("ended: the server has stopped")
@@ -568,16 +645,153 @@ def restarter():
     return restart
 
 
+# --- The ticker (johntrandall's fork) -------------------------------------
+#
+# One ticker per session rewrites the idle agents' bars at segment
+# boundaries only: it sleeps until the next pane is due to lose a segment,
+# reports that pane alone, and ends once no idle cache is warm. It never
+# lists agents or reads conversations; it works from the windows the last
+# run wrote, and a run wakes it with SIGUSR1 after writing new ones. It
+# takes the runs' lock while it reports, so a bar never lands on an agent
+# a run has just seen start working.
+
+
+def write_windows(windows):
+    path = state_file("windows.json")
+    with open(path + ".new", "w") as f:
+        json.dump({"written_at": time.time(), "windows": windows}, f)
+    os.replace(path + ".new", path)
+
+
+def read_windows():
+    try:
+        with open(state_file("windows.json")) as f:
+            state = json.load(f)
+        return state.get("written_at", 0), state.get("windows", {})
+    except (OSError, ValueError, AttributeError):
+        return 0, {}
+
+
+def kick_ticker():
+    """Wake the session's ticker, or start one if none is running. Only
+    Herdr's runs start one, as with the watcher."""
+    if not HERDR_STATE_DIR:
+        return
+    with open(state_file("ticker.lock"), "w") as lock:
+        if not take(lock):
+            # Held, so a ticker is alive and its pid file is current.
+            try:
+                with open(state_file("ticker.pid")) as f:
+                    os.kill(int(f.read().strip()), signal.SIGUSR1)
+            except (OSError, ValueError):
+                pass
+            return
+    with open(state_file("ticker.log"), "a") as log_file:
+        subprocess.Popen(
+            [sys.executable, SCRIPT, "ticker"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=log_file,
+            start_new_session=True,
+            close_fds=True,
+        )
+
+
+class Wake(Exception):
+    """Raised by SIGUSR1 to cut the ticker's sleep short."""
+
+
+def on_wake(_signum, _frame):
+    raise Wake
+
+
+def wait(seconds):
+    """Sleep, but wake at once on SIGUSR1. The signal is blocked at all
+    other times, so it never lands mid-report; one sent then is delivered as
+    soon as the next sleep unblocks it. (macOS has no sigtimedwait.)"""
+    try:
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGUSR1})
+        time.sleep(seconds)
+    except Wake:
+        pass
+    finally:
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+
+
+def ticker():
+    # Block SIGUSR1 before anyone can find the pid: unhandled, it would end us.
+    signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+    signal.signal(signal.SIGUSR1, on_wake)
+    lock = open(state_file("ticker.lock"), "w")
+    if not take(lock):
+        return
+    with open(state_file("ticker.pid"), "w") as f:
+        f.write(str(os.getpid()))
+    tick_log("started")
+    shown = {}
+    while True:
+        # Again each time: a Wake landing inside wait()'s finally skips its block.
+        signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGUSR1})
+        if not enabled():
+            tick_log("ended: the plugin is disabled")
+            return
+        read_at = time.time()
+        written_at, windows = read_windows()
+        with open(state_file("running.lock"), "w") as running:
+            fcntl.flock(running, fcntl.LOCK_EX)
+            now = time.time()
+            for pane_id, (start, until) in windows.items():
+                key = (pane_id, until)
+                previous = shown.get(key) or bar(start, until, written_at)
+                try:
+                    if until <= now:
+                        if shown.get(key) != "cleared":
+                            # Normally Herdr has dropped it already; after the
+                            # Mac slept, its lifetime stood still.
+                            herdr("pane", "report-metadata", pane_id, "--source", SOURCE,
+                                  "--clear-token", LABEL_TOKEN, "--clear-token", BAR_TOKEN)
+                            shown[key] = "cleared"
+                        continue
+                    current = bar(start, until, now)
+                    if current != previous:
+                        report_bar(pane_id, start, until, now)
+                    shown[key] = current
+                except (subprocess.SubprocessError, OSError, ValueError, LookupError) as error:
+                    # The pane may have closed; the next run drops it.
+                    tick_log(f"{pane_id}: {error}")
+                    shown[key] = "cleared"
+        perf_log(f"tick warm={sum(1 for _, until in windows.values() if until > now)}")
+        live = [(start, until) for start, until in windows.values() if until > now]
+        if not live:
+            if modified(state_file("windows.json")) > read_at:
+                continue
+            tick_log("ended: no idle cache is warm")
+            return
+        wake = min(next_boundary(start, until, now) for start, until in live)
+        try:
+            wait(min(max(wake - time.time() + 0.5, 1), TICKER_MAX_SLEEP_SECONDS))
+        except Wake:
+            pass
+
+
+def tick_log(message):
+    print(f"{datetime.now():%Y-%m-%d %H:%M:%S} ticker {os.getpid()}: {message}", file=sys.stderr, flush=True)
+
+
 def log(message):
     print(f"{datetime.now():%Y-%m-%d %H:%M:%S} watcher {os.getpid()}: {message}", file=sys.stderr, flush=True)
 
 
 if __name__ == "__main__":
-    if sys.argv[1:] == ["watch"]:
+    if sys.argv[1:] == ["ticker"]:
+        ticker()
+    elif sys.argv[1:] == ["watch"]:
         if not HERDR_STATE_DIR:
             sys.exit("Only Herdr's runs start the watcher (see start_watcher).")
         watch()
     else:
         with turn() as my_turn:
-            if my_turn and reconcile():
+            if not my_turn:
+                perf_log("skip")
+            elif reconcile():
                 sys.exit(1)
