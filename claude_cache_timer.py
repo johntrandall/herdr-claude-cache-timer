@@ -455,19 +455,20 @@ def reconcile():
             if agent["agent_status"] != "working" and files[agent["pane_id"]]
         ]
     )
-    failed = report_all(agents, files)
+    seen = {}
+    failed = report_all(agents, files, seen)
     if any(watched(agent) for agent in agents):
         start_watcher()
-    # The idle agents whose bar the ticker must step down.
+    # The idle agents whose bar the ticker must step down, from the windows
+    # report_all has just read (reading every file again cost a second pass).
     now = time.time()
-    windows = {}
-    for agent in agents:
-        path = files.get(agent["pane_id"])
-        if path is None or agent["agent_status"] == "working":
-            continue
-        window = cache_window(path)
-        if window and window[1] > now:
-            windows[agent["pane_id"]] = [window[0], int(window[1])]
+    windows = {
+        agent["pane_id"]: [seen[agent["pane_id"]][0], int(seen[agent["pane_id"]][1])]
+        for agent in agents
+        if agent["agent_status"] != "working"
+        and seen.get(agent["pane_id"])
+        and seen[agent["pane_id"]][1] > now
+    }
     write_windows(windows)
     if windows:
         kick_ticker()
@@ -475,14 +476,17 @@ def reconcile():
     return failed
 
 
-def report_all(agents, files):
+def report_all(agents, files, seen=None):
     """Bring the agents' tokens up to date from their files, and return
-    whether any report failed."""
+    whether any report failed. The windows read go into seen, if given."""
     failed = False
     for agent in agents:
         path = files.get(agent["pane_id"])
         try:
-            report(agent, cache_window(path) if path else None)
+            window = cache_window(path) if path else None
+            if seen is not None:
+                seen[agent["pane_id"]] = window
+            report(agent, window)
         except subprocess.CalledProcessError as error:
             # The pane may have closed since the list; the others still count.
             print(f"{agent['pane_id']}: {error.stderr.strip() or error}", file=sys.stderr)
